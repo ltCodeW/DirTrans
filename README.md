@@ -1,5 +1,5 @@
 # DirTrans
-编译：
+编译：<br>
     gcc ./server.c -o server -pthread
     gcc ./client.c -o client
 运行
