@@ -3,33 +3,45 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <dirent.h>
+#include <libgen.h>
 
-#define MAXLINE 4096
 #define PORT 11710
-#define SEND_SZ (4096)
-#define RECV_SZ (1024)
-#define FILE_SZ 8192
+#define BUF_SZ (4096)
+#define FILE_SZ (8192)
+#define LEN_OFFSET (BUF_SZ-5)
+
+//flag
 enum
 {
-    UPLOAD = 0,
+    UPLOAD = 1,
     DOWNLOAD,
 };
 enum
 {
-    FNAME_FIN=1,
-    FNAME_NFIN,
-    FCON_FIN,
-    FCON_NFIN,
+    FNAME_FIN = 1,//文件名，非这次传输的最后一个文件
+    FNAME_NFIN,   //文件名，这次传输的最后一个文件
+    FCON_FIN,     //文件内容，是这个文件的需最后的数据
+    FCON_NFIN,    //文件内容，不是这个文件的需最后的数据
+    CMD,          //命令
+    PATH,         //文件路径
 };
+//处理client请求
 void response(void *confd);
+//从client接受文件信息，存储到服务器
 void save_file_to_server(int confd);
+//从client接受文件名，将文件发送给client
 void send_file_to_client(int confd);
+//将dirpath文件夹中的所有文件的完整路径存储到fileNames中
+//fileNames中的格式各路径用\n间隔，如"path1\npath2...pathn",
 int walkdir(char *dirpath, char *fileNames);
+//确保dirpath文件夹下可以生成文件
+int check_mkpath(char *dirpath);
 
 int main()
 {
@@ -63,8 +75,7 @@ int main()
         return 0;
     }
 
-    printf("====waiting for client's request=======\n");
-    //accept 和recv,注意接收字符串添加结束符'\0'
+    //printf("waiting for client's request...\n");
     while (1)
     {
 
@@ -79,29 +90,42 @@ int main()
     close(listenfd);
     return 0;
 }
-
+int check_warp(int len,char* addr){
+    int len_insddr = *(int*)addr;
+    if(len!=len_insddr){
+        printf("len %d,len in addr %d,NOT EQUAL!\n", len, len_insddr);
+        return -1;
+    }
+    return 0;
+}
 void response(void *arg)
 {
     int recv_len = 0;
-    char recv_buf[RECV_SZ] = {0}; // 接收缓冲区
+    char recv_buf[BUF_SZ] = {0}; // 接收缓冲区
     int connfd = *((int *)arg);
     int order = 0;
 
-    recv_len = recv(connfd, recv_buf, RECV_SZ, 0);
+    recv_len = recv(connfd, recv_buf, BUF_SZ, 0);
     if (recv_len < 0)
     {
         printf("send msg error: %s(errno :%d)\n", strerror(errno), errno);
         return;
     }
+
     order = recv_buf[0];
+    if(recv_buf[BUF_SZ-1]!=CMD){
+        printf("command miss\n");
+        return ;
+    }
+
     switch (order)
     {
     case (UPLOAD):
-        printf("save_file_to_server \n");
+       // printf("save_file_to_server \n");
         save_file_to_server(connfd);
         break;
     case (DOWNLOAD):
-        printf("send_file_to_client \n");
+     //   printf("send_file_to_client \n");
         send_file_to_client(connfd);
         break;
     }
@@ -109,62 +133,73 @@ void response(void *arg)
 //先送文件名，再送文件内容
 int sendfile(int confd, char *file, int if_fname_fin)
 {
-    FILE *fp = fopen(file, "rb");
-    int send_len;
-    //最后1个位置放标志位，
-    char send_buf[SEND_SZ] = {0};
+    int content_len;    
+    char send_buf[BUF_SZ] = {0};
 
-    if(strlen(file)+1 >= SEND_SZ){
+    FILE *fp = fopen(file, "rb");
+    if(strlen(file)+1+5 >= BUF_SZ){
         printf("file name too long \n");
         return -1;
     }
-    strncat(send_buf, file, strlen(file) + 1);
-    send_buf[SEND_SZ - 1] = if_fname_fin;
 
-    send_len = send(confd, send_buf,  SEND_SZ, 0);
+    //send file name
+    strncpy(send_buf, file, strlen(file) + 1);
+    content_len = strlen(file) + 1;
+    send_buf[BUF_SZ - 1] = if_fname_fin;
+    strncpy(send_buf + LEN_OFFSET, (char *)&content_len, sizeof(int));
+    
+    check_warp(content_len,send_buf + LEN_OFFSET);
 
-    memset(send_buf, 0, SEND_SZ);
-    while ((send_len = fread(send_buf, 1, SEND_SZ-1, fp)) > 0)
+    send(confd, send_buf,  BUF_SZ, 0);
+
+    memset(send_buf, 0, BUF_SZ);
+    while ((content_len = fread(send_buf, 1, BUF_SZ-5, fp)) >= 0)
     {
-        if(send_len == SEND_SZ-1){
-            send_buf[SEND_SZ - 1] = FCON_NFIN;
-            send(confd, send_buf, SEND_SZ, 0);
+        if(content_len == BUF_SZ-5){
+            send_buf[BUF_SZ - 1] = FCON_NFIN;
         }else{
-            memset(send_buf + send_len, 0, SEND_SZ - send_len);
-            send_buf[SEND_SZ - 1] = FCON_FIN;
-            send(confd, send_buf, SEND_SZ, 0);
+            send_buf[BUF_SZ - 1] = FCON_FIN;
         }
+        strncpy(send_buf + LEN_OFFSET, (char *)&content_len, sizeof(int));
         
+        check_warp(content_len,send_buf + LEN_OFFSET);
+        
+        send(confd, send_buf, BUF_SZ, 0);
+
+        if(send_buf[BUF_SZ - 1] == FCON_FIN)
+            break;
     }
-    //发送结束字段
-    // memset(send_buf, 0, SEND_SZ);
-    // send_buf[SEND_SZ-1] = FCON_FIN;
-    // send(confd, send_buf, SEND_SZ, 0);
-    printf("finish send %s\n", file);
+
 }
-void save_file_to_server(int confd) { ; }
+
 void send_file_to_client(int confd)
 {
 
-    int recv_len, send_len;
-    char recv_buf[RECV_SZ] = {0};
-    char send_buf[SEND_SZ] = {0};
+    int recv_len, send_len,content_len;
+    char recv_buf[BUF_SZ] = {0};
+    char send_buf[BUF_SZ] = {0};
     char path[1024] = {0};
     //要保证可容纳存储路径后的文件路径文件名总长
     char fileNames[FILE_SZ] = {0};
     //收文件路径
-    recv_len = recv(confd, recv_buf, RECV_SZ, 0);
+    recv_len = recv(confd, recv_buf, BUF_SZ, 0);
+    strncpy(path, recv_buf, strlen(recv_buf)+1);
     if (recv_len < 0)
     {
         perror("recv");
         return;
     }
-    strncpy(path, recv_buf, strlen(recv_buf));
-    path[recv_len] = 0;
+    if(recv_buf[BUF_SZ-1]!=PATH){
+        printf("path missed\n");
+        return ;
+    }
+    content_len = *(int *)(&recv_buf[LEN_OFFSET]);
+    if(check_warp(content_len,recv_buf+LEN_OFFSET)!=0){
+        printf("path wrong\n");
+        return ;
+    }
 
     //得到文件夹下所有完整路路径，以\n间隔路径名
-    printf("path:%s\n", path);
-    printf("-------------------------\n");
     walkdir(path, fileNames);
     char *tmp_ftail = fileNames;
     char *tmp_fhead = fileNames;
@@ -173,7 +208,6 @@ void send_file_to_client(int confd)
         if (*tmp_ftail == '\n')
         {
             *tmp_ftail = 0;
-            printf("send tmp_fhead %s \n", tmp_fhead);
             if (*(tmp_ftail+1) == 0){
                 sendfile(confd, tmp_fhead, FNAME_FIN);
             }
@@ -185,7 +219,6 @@ void send_file_to_client(int confd)
         tmp_ftail++;
     }
     close(confd);
-    printf("wancheng\n");
 }
 
 int walkdir(char *path, char *files)
@@ -233,3 +266,99 @@ int walkdir(char *path, char *files)
     closedir(dir);
     return 1;
 }
+int recvfile(int sockfd, char *server_root,  int *final_flg)
+{
+    int recv_len,content_len;
+    char filename[1024] = {0};
+    char recv_buf[BUF_SZ] = {0};
+    char *rela_path;
+
+    recv_len = recv(sockfd, recv_buf, BUF_SZ, 0);
+    if (recv_len < 0)
+    {
+        perror("recv");
+        return -1;
+    }
+
+    *final_flg = recv_buf[BUF_SZ - 1];
+    content_len = *(int*)(&recv_buf[LEN_OFFSET]);
+
+    check_warp(content_len,recv_buf + LEN_OFFSET);
+
+    if (!(*final_flg == FNAME_NFIN || *final_flg == FNAME_FIN))
+    {
+        printf("filename miss\n");
+        return -1;
+    }
+
+    rela_path = recv_buf;
+    strncpy(filename, server_root, strlen(server_root) + 1);
+    strncat(filename, rela_path, strlen(rela_path) + 1);
+    //printf("making %s\n", filename);
+
+    char tmpdirname[1024] = {0};
+    strncpy(tmpdirname, filename, strlen(filename) + 1);
+    if (check_mkpath(dirname(tmpdirname)) != 0)
+    {
+        printf("Fail to save file\n");
+    }
+
+    FILE *fp = fopen(filename, "wb"); //以二进制方式打开（创建）文件
+    if (fp == NULL)
+    {
+        printf("Cannot open file %s\n", filename);
+        exit(0);
+    }
+    int content_flag = 0;
+    while (recv_len = recv(sockfd, recv_buf, BUF_SZ, 0))
+    {
+        if(recv_len != BUF_SZ){
+            printf("send and recv different bytes\n");
+            return -1;
+        }
+        printf("%s recv %d bytes\n",filename,recv_len);
+        content_len = *(int *)(&recv_buf[LEN_OFFSET]);
+        content_flag = recv_buf[BUF_SZ - 1];
+
+        fwrite(recv_buf, 1, content_len, fp);
+
+        //check_warp(content_len,recv_buf + LEN_OFFSET);
+
+        if(content_flag == FCON_FIN){
+            break;
+        }else if(content_flag == FCON_NFIN){
+            continue;
+        }else{
+            printf("Unkown flag \n");
+            return -1;
+        }
+    }
+
+    fclose(fp);
+   // printf("recv file %s\n",filename);
+}
+int check_mkpath(char *dirpath)
+{
+    char dir[1024] = {0};
+    strncpy(dir, dirpath, strlen(dirpath) + 1);
+    if (access(dirpath, F_OK) != 0)
+    {
+        if (mkdir(dirpath, S_IRWXU | S_IRWXG | S_IRWXO) != 0)
+        {
+            dirname(dir);
+            check_mkpath(dir);
+            mkdir(dirpath, S_IRWXU | S_IRWXG | S_IRWXO);
+        }
+        return access(dirpath, F_OK);
+    }
+    return 0;
+}
+void save_file_to_server(int sockfd) {
+    char server_root[] = "/home/lt/testsavedir";
+    int flag = 0;
+    do
+    {
+        recvfile(sockfd, server_root, &flag);
+    } while (flag==FNAME_NFIN); 
+    
+ }
